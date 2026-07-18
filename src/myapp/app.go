@@ -40,9 +40,11 @@ type model struct { //one note
 	newfileinput   textinput.Model
 	newfilenames   []string //list of filenames created with ctrl+N
 	textVisibility bool
-	currentFile    *os.File //type is a file pointer
+	noteFiles      []*os.File  //mabye ill refactor this to just an array of filenames had the wrong idea about file pointers, but they do work
 	notetextareas  []textarea.Model
 	activeTab      int //stores info for currently active tab
+	viewMode       bool
+	savedFiles     []string
 }
 
 // now we define what its INITIAL state is : Init function
@@ -93,6 +95,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //returns new model st
 
 	switch msg := msg.(type) { //switches the TYPE of msg
 
+	case tea.MouseClickMsg: //handles mouse click events, rn uses only X axis to decide for now
+		m2 := msg.Mouse()
+		if m2.Button == tea.MouseLeft {
+			x := m2.X
+			cursor := 0
+			for i, name := range m.newfilenames {
+				var w int
+				if i == m.activeTab {
+					w = gloss.Width(activeTabStyle.Render(name))
+				} else {
+					w = gloss.Width(tabStyle.Render(name))
+				}
+				if x >= cursor && x < cursor+w {
+					m.activeTab = i                //mabye handling more cases will be more convienient later
+					if i < len(m.noteFiles) && m.noteFiles[i] != nil {
+						content, err := os.ReadFile(m.noteFiles[i].Name())
+						if err == nil {
+							m.notetextareas[i].SetValue(string(content))
+						}
+					}
+					return m, nil
+				}
+				cursor += w
+			}
+		}
+
 	case tea.KeyMsg:
 
 		switch msg.String() {
@@ -102,45 +130,125 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //returns new model st
 
 		case "ctrl+n": //to open a new tab
 			m.textVisibility = true //opens the input area for it to take the new filename
+			m.viewMode = false
+			m.newfileinput.Placeholder = "new filename (dont include .md)"
+			m.newfileinput.SetValue("")
+			return m, nil
+
+		case "ctrl+o":
+			entries, err := os.ReadDir(vaultdir)
+			if err != nil {
+				return m, nil
+			}
+			m.savedFiles = []string{}
+			for _, tempfile := range entries {
+				if !tempfile.IsDir() && strings.HasSuffix(tempfile.Name(), ".md") {
+					m.savedFiles = append(m.savedFiles, strings.TrimSuffix(tempfile.Name(), ".md"))
+				}
+			}
+			m.viewMode = true
+			m.textVisibility = false
+			m.newfileinput.Placeholder = "enter file number to open respective file"
+			m.newfileinput.SetValue("")
+			return m, nil
+
+		case "escape":
+			m.viewMode = false
+			m.textVisibility = false
+			m.newfileinput.Placeholder = "new filename (dont include .md)"
+			m.newfileinput.SetValue("")
 			return m, nil
 
 		case "ctrl+h", "left": // Navigate left
 			if m.activeTab > 0 {
 				m.activeTab--
+				if m.activeTab < len(m.noteFiles) && m.noteFiles[m.activeTab] != nil {
+					content, err := os.ReadFile(m.noteFiles[m.activeTab].Name())
+					if err == nil {
+						m.notetextareas[m.activeTab].SetValue(string(content))
+					}
+				}
 			}
 			return m, nil
 
 		case "ctrl+l", "right": // Navigate right
 			if m.activeTab < len(m.notetextareas)-1 {
 				m.activeTab++
+				if m.activeTab < len(m.noteFiles) && m.noteFiles[m.activeTab] != nil {
+					content, err := os.ReadFile(m.noteFiles[m.activeTab].Name())
+					if err == nil {
+						m.notetextareas[m.activeTab].SetValue(string(content))
+					}
+				}
 			}
 			return m, nil
 
 		case "ctrl+s":
 			//saving data
-			if m.currentFile == nil {
+			if len(m.noteFiles) == 0 || m.noteFiles[m.activeTab] == nil {
 				break
 			}
-			if err := m.currentFile.Truncate(0); err != nil {
+			f := m.noteFiles[m.activeTab]
+			if err := f.Truncate(0); err != nil {
 				fmt.Printf("Error saving file: %v\n", err)
 				return m, nil
 			}
-			if _, err := m.currentFile.Seek(0, 0); err != nil {
+			if _, err := f.Seek(0, 0); err != nil {
 				fmt.Printf("Error saving file: %v\n", err)
 				return m, nil
 			}
-			if _, err := m.currentFile.WriteString(m.notetextareas[m.activeTab].Value()); err != nil {
+			if _, err := f.WriteString(m.notetextareas[m.activeTab].Value()); err != nil {
 				fmt.Printf("Error saving file: %v\n", err)
 				return m, nil
 			}
-			if err := m.currentFile.Close(); err != nil {
-				fmt.Printf("Error closing file: %v\n", err)
+			if err := f.Sync(); err != nil {
+				fmt.Printf("Error syncing file to disk: %v\n", err)
 			}
-			m.currentFile = nil
-			m.notetextareas[m.activeTab].SetValue("")
 			return m, nil
 
 		case "enter":
+
+			if m.viewMode {
+				idxStr := m.newfileinput.Value()
+				if idxStr == "" {
+					return m, nil
+				}
+				idx := 0
+				fmt.Sscanf(idxStr, "%d", &idx)
+				idx--
+				m.newfileinput.SetValue("")
+				if idx < 0 || idx >= len(m.savedFiles) {
+					return m, nil
+				}
+				name := m.savedFiles[idx]
+				for _, existing := range m.newfilenames {
+					if existing == name {
+						m.viewMode = false
+						return m, nil
+					}
+				}
+				fpath := filepath.Join(vaultdir, name+".md")
+				content, err := os.ReadFile(fpath)
+				if err != nil {
+					return m, nil
+				}
+				f, err := os.OpenFile(fpath, os.O_RDWR, 0644)
+				if err != nil {
+					return m, nil
+				}
+				m.newfilenames = append(m.newfilenames, name)
+				m.noteFiles = append(m.noteFiles, f)
+
+				textArea := textarea.New() //opens new text area for that specific file
+				textArea.Placeholder = "Write your notes here..."
+				textArea.SetValue(string(content))
+				textArea.Focus()
+				m.notetextareas = append(m.notetextareas, textArea) //adding new text area to array of textareas
+				m.activeTab = len(m.notetextareas) - 1              //active tab becomes the latest added tab
+				m.viewMode = false
+				m.newfileinput.Placeholder = "new filename (dont include .md)"
+				return m, nil
+			}
 
 			filename := m.newfileinput.Value()
 
@@ -154,13 +262,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //returns new model st
 					log.Fatalf("%v", err)
 				}
 
-				m.currentFile = f
 				m.textVisibility = false                          //closes the filename input box
 				m.newfilenames = append(m.newfilenames, filename) //adds it to the array of filenames in model
-				m.newfileinput.SetValue("")                       //sets the filename inputbox back to null
+				m.noteFiles = append(m.noteFiles, f)
+				m.newfileinput.SetValue("") //sets the filename inputbox back to null
 
 				textArea := textarea.New() //opens new text area for that specific file
 				textArea.Placeholder = "Write your notes here..."
+				textArea.SetValue("")
 				textArea.Focus()
 
 				m.notetextareas = append(m.notetextareas, textArea) //adding new text area to array of textareas
@@ -170,10 +279,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //returns new model st
 		}
 	}
 
-	if m.textVisibility {
+	if m.textVisibility || m.viewMode {
 		m.newfileinput, cmd = m.newfileinput.Update(msg)
 	}
-	if m.currentFile != nil { //i.e. if there's a file selected
+	if len(m.noteFiles) > 0 && m.activeTab < len(m.noteFiles) && m.noteFiles[m.activeTab] != nil { //i.e. if there's a file selected
 		m.notetextareas[m.activeTab], cmd = m.notetextareas[m.activeTab].Update(msg)
 		cmds = append(cmds, cmd)
 	}
@@ -194,18 +303,25 @@ func (m model) View() tea.View { //whatever is model, it returns a tea.View i.e.
 
 	welc := style.Render("Welcome to BubbleTea Cafe! 🧋") //the very first title of the app
 
-	help := "ctrl+N : new file | arrows : change tab | ctrl+S : save | ctrl+C/q : quit" //line that displays available commands
+	help := "ctrl+N : new file | ctrl+O : view files | arrows/click : change tab | ctrl+S : save | ctrl+C/q : quit" //line that displays available commands
 
 	view := "" //main UI
 
-	if m.textVisibility {
-		view = m.newfileinput.View()
-
-		if len(m.notetextareas) > 0 {
-			m.notetextareas[m.activeTab].Blur()
+	if m.viewMode {
+		if len(m.savedFiles) == 0 {
+			view = "No saved notes found.\n\nPress ESC to go back."
+		} else {
+			lines := []string{"Your saved notes (type number + enter to open):\n"}
+			for i, name := range m.savedFiles {
+				lines = append(lines, fmt.Sprintf("  %d. %s", i+1, name))
+			}
+			lines = append(lines, "\n"+m.newfileinput.View())
+			lines = append(lines, "Press ESC to go back.")
+			view = strings.Join(lines, "\n")
 		}
-
-	} else if m.currentFile != nil { //its either filename or file so added elseif
+	} else if m.textVisibility {
+		view = m.newfileinput.View()
+	} else if len(m.noteFiles) > 0 && m.activeTab < len(m.noteFiles) && m.noteFiles[m.activeTab] != nil { //its either filename or file so added elseif
 		view = m.notetextareas[m.activeTab].View()
 	}
 
@@ -213,7 +329,6 @@ func (m model) View() tea.View { //whatever is model, it returns a tea.View i.e.
 	var tabs []string
 	for i := range m.newfilenames {
 		title := m.newfilenames[i]
-		//title := "note"
 		if i == m.activeTab {
 			tabs = append(tabs, activeTabStyle.Render(title))
 		} else {
@@ -223,7 +338,10 @@ func (m model) View() tea.View { //whatever is model, it returns a tea.View i.e.
 	renderedTabs := tabsRowStyle.Render(strings.Join(tabs, "")) //joining all rendered tabs together
 
 	s := fmt.Sprintf("\n%s\n\n%s\n\n%s\n\n%s", welc, renderedTabs, view, help) //returns the fmt specified string
-	return tea.NewView(s)                                                      //right now returns whatever is in the model
+
+	v := tea.NewView(s)
+	v.MouseMode = tea.MouseModeCellMotion //enables mouse support via bubbletea v2 view-level mouse mode
+	return v
 }
 
 // finally running the main thing, quits it if theres an error or q is pressed
