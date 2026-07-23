@@ -7,11 +7,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	//UI
 	tea "charm.land/bubbletea/v2"
+	"charm.land/bubbles/v2/textinput"
 	lipgloss "charm.land/lipgloss/v2"
 
 	//wish SSH server packages
@@ -23,45 +25,92 @@ import (
 	"github.com/charmbracelet/ssh"
 )
 
-const ( //where its being hosted
-	host = "localhost" //0.0.0.0 for listening into all interfaces i.e. production
-	port = "3000"      //port: 22 is protected
+const (
+	host = "localhost"
+	port = "3000"
 )
 
-var ( //all global variables, styles grouped together
-
-	//ALL STYLES
-
+var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("199")) //hot pink
+			Foreground(lipgloss.Color("199"))
 
 	musshStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("51")) //cyan
+			Foreground(lipgloss.Color("51"))
 
 	welcStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("99")) //lavender
+			Foreground(lipgloss.Color("99"))
+
+	systemStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("214"))
+
+	messageStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("255"))
+
+	usernameStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("141"))
+
+	sessions   = make([]*userSession, 0) //global slice of all connected users
+	sessionsMu sync.Mutex                //mutex to protect sessions slice from race conditions
 )
 
-func main() {
-	//filepath := os.Getenv("SSH_HOST_KEY_PATH")
-	// Retrieve raw string data (e.g., from container/cloud env)
+// stores each connected user's program reference and username
+type userSession struct {
+	username string
+	program  *tea.Program
+}
 
-	// Retrieve the host key file path from the environment
-	keyPath := os.Getenv("SSH_HOST_KEY_PATH")
+//  message type that gets broadcast to all users
+type chatMsg struct {
+	username string
+	text     string
+	system   bool //true if its a system message like "X joined"
+}
+
+// broadcast sends a chatMsg to every connected user's program
+func broadcast(msg chatMsg) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	for _, s := range sessions {
+		s.program.Send(msg)
+	}
+}
+
+// addSession safely adds a new user session to the global slice
+func addSession(s *userSession) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	sessions = append(sessions, s)
+}
+
+// removeSession safely removes a user session when they disconnect
+func removeSession(s *userSession) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	for i, sess := range sessions {
+		if sess == s {
+			sessions = append(sessions[:i], sessions[i+1:]...) //removes that session by ignoring that particular index of i
+			return
+		}
+	}
+}
+
+func main() {
+	keyPath := os.Getenv("SSH_HOST_KEY_PATH")  
 	if keyPath == "" {
-		// Fallback to a default path if the environment variable isn't set
 		keyPath = ".ssh/id_ed25519"
 	}
 
-	s, err := wish.NewServer( //new server with the name s
+	s, err := wish.NewServer(
 		wish.WithAddress(net.JoinHostPort(host, port)),
-		wish.WithHostKeyPath(keyPath), //path for SSH keys
-		wish.WithMiddleware( //including the required middleware
-			bubbletea.Middleware(teaHandler), //the bubbletea middleware requires a TeaHandler fn
-			activeterm.Middleware(),          // Bubble Tea apps usually require a PTY.
+		wish.WithHostKeyPath(keyPath),
+		wish.WithMiddleware(
+			myMiddleware(),
+			activeterm.Middleware(),
 			logging.Middleware(),
 		),
 	)
@@ -69,12 +118,11 @@ func main() {
 		log.Error("Could not start server", "error", err)
 	}
 
-	//making a goroutine for the user
-	done := make(chan os.Signal, 1)                                    //makes an OS channel which can only queue one signal at a time (1)
-	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM) //?
-	log.Info("Starting SSH chat server", "host", host, "port", port)
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)  //ctrl+c to end the server
+	log.Info("Starting SSH chat server", "host", host, "port", port)    //start up info
 
-	go func() { //the goroutine
+	go func() {           // error handling for server start up
 		if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			log.Error("Could not start server", "error", err)
 			done <- nil
@@ -84,11 +132,45 @@ func main() {
 	<-done
 	log.Info("Stopping SSH chat server")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-
 	defer func() { cancel() }()
 	if err := s.Shutdown(ctx); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 		log.Error("Could not stop server", "error", err)
 	}
+}
+
+// myMiddleware uses MiddlewareWithProgramHandler so we get access to *tea.Program
+// which we need to call p.Send() for broadcasting messages to each user
+func myMiddleware() wish.Middleware {
+	teaHandler := func(s ssh.Session) *tea.Program {
+		pty, _, active := s.Pty()
+		if !active {
+			wish.Fatalln(s, "no active terminal, ending")
+			return nil
+		}
+
+		sess := &userSession{}                               //create a new user session for this connection
+		m := initialModel(sess, pty.Window.Width, pty.Window.Height) //create a new model for this user session
+		p := tea.NewProgram(m, bubbletea.MakeOptions(s)...)    //create a new bubbletea program for this user session
+		sess.program = p 
+
+		//add session to global slice when user connects
+		addSession(sess)
+
+		//remove session and broadcast disconnect message when user disconnects
+		go func() {
+			<-s.Context().Done()
+			if sess.username != "" {
+				broadcast(chatMsg{
+					text:   fmt.Sprintf("%s left the chat", sess.username),
+					system: true,
+				})
+			}
+			removeSession(sess)
+		}()
+
+		return p
+	}
+	return bubbletea.MiddlewareWithProgramHandler(teaHandler)
 }
 
 /*------------------------------------------------------------------------------------*/
@@ -97,75 +179,167 @@ func main() {
 //it to the middleware for it to handle, it's abstracted away
 //also styles is stored as a global variable at the top
 
-func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-	s.Pty() //the pseudo teletype is used to deliver the ui front and back safely (api-ish)
+// screen represents which screen the user is currently on
+type screen int
 
-	return initialModel(), []tea.ProgramOption{}
-}
+const (
+	usernameScreen screen = iota //iota is basically enumaration
+	chatScreen                   //
+)
 
-// MODEL : stores info of current state of app
+// model stores the current state of the app for each connected user
 type model struct {
+	sess          *userSession
+	currentScreen screen
+	usernameInput textinput.Model //input box for username entry
+	messageInput  textinput.Model //input box for chat messages
+	messages      []chatMsg       //history of all received messages
+	width         int
+	height        int
 }
 
-func initialModel() model {
-	return model{}
+func initialModel(sess *userSession, width, height int) model {
+	//username input setup
+	unInput := textinput.New()
+	unInput.Placeholder = "enter your username"
+	unInput.Focus()
+	unInput.CharLimit = 20
+	unInput.SetWidth(40)
+
+	//message input setup
+	msgInput := textinput.New()
+	msgInput.Placeholder = "type a message..."
+	msgInput.CharLimit = 200
+	msgInput.SetWidth(width - 4)
+
+	return model{
+		sess:          sess,
+		currentScreen: usernameScreen,
+		usernameInput: unInput,
+		messageInput:  msgInput,
+		messages:      []chatMsg{},
+		width:         width,
+		height:        height,
+	}
 }
 
-//INIT METHOD : creating a method on the model (function meant for model struct)
-
-func (m model) Init() tea.Cmd { //we'll never run this ourselves this is something tea runs itself
+func (m model) Init() tea.Cmd {
 	return nil
 }
 
-// UPDATE METHOD : never manually used, run by tea, takes in a msg(what happened) and returns updated model
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //updated model is tea.Model not the actual model struct because we're doing pass by copy
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
 
-	// tea.Model is abstracted away from us
-	//tea.Msg gives info about the event that has happened
+	switch msg := msg.(type) {
 
-	//case : event is a key press
-	if val, ok := msg.(tea.KeyPressMsg); ok {
-		//check if type casting it to a keypress works
-		key := val.String() //returns a string form of the key pressed eg ctrl + c
+	case tea.WindowSizeMsg: //update dimensions if terminal is resized
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	case chatMsg: //a broadcast message arrived, append to history
+		m.messages = append(m.messages, msg)
+		return m, nil
+
+	case tea.KeyPressMsg:
+		key := msg.String()
 
 		switch key {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+
+		case "enter":
+			if m.currentScreen == usernameScreen {
+				username := m.usernameInput.Value()
+				if username == "" {
+					return m, nil
+				}
+				//set username on the session so broadcast can use it
+				m.sess.username = username
+				m.currentScreen = chatScreen
+				m.messageInput.Focus()
+				m.usernameInput.Blur()  
+				//broadcast join message to everyone
+				go broadcast(chatMsg{
+					text:   fmt.Sprintf("%s joined the chat", username),
+					system: true,
+				})
+				return m, nil
+			}
+
+			if m.currentScreen == chatScreen {
+				text := m.messageInput.Value()
+				if text == "" {                                //if input is nothing skip
+					return m, nil
+				}
+				m.messageInput.SetValue("")
+				//broadcast the message to all users
+				go broadcast(chatMsg{
+					username: m.sess.username,            
+					text:     text,
+					system:   false,
+				})
+				return m, nil
+			}
 		}
 	}
 
-	//incase no switch case caught
-	return m, nil //basic return statement
+	//route input updates to the correct input box based on current screen
+	if m.currentScreen == usernameScreen {
+		m.usernameInput, cmd = m.usernameInput.Update(msg)
+	} else {
+		m.messageInput, cmd = m.messageInput.Update(msg)
+	}
+
+	return m, cmd
 }
 
-// View method : returns tea.NewView
 func (m model) View() tea.View {
-	//view is just a string things printed out onto the terminal in the form of Ui
+	if m.currentScreen == usernameScreen {
+		return m.usernameView()
+	}
+	return m.chatView()
+}
 
-	//welcome UI
+// usernameView is the first screen shown when a user connects
+func (m model) usernameView() tea.View {
 	welc := headerStyle.Render("Welcome To")
-
-	//ignore red spaces
 	mussh := musshStyle.Render(`
-	         ___  ___  _ _                       
- _ _ _  _ _ / __]/ __]| | | _ _  ___  ___  _ _ _ 
+         ___  ___  _ _                        
+ _ _ _  _ _ / __]/ __]| | | _ _  ___  ___  _ _ _  
 | ' ' || | |\__ \\__ \|   || '_]/ . \/ . \| ' ' |
 |_|_|_| \__|[___/[___/|_|_||_|  \___/\___/|_|_|_|`)
 
-	welcmsg := welcStyle.Render("🧋 Glad you’re here! Use the /help command to know more\n✨ Be respectful, everyone’s here to have fun!")
-
-	border := headerStyle.Render("____________________________________________________________")
-
-	//FINAL VIEW
-	s := fmt.Sprintf("\n%s%s\n\n%s\n%s\n", welc, mussh, welcmsg, border)
+	prompt := welcStyle.Render("Choose a username to join the chat:")
+	s := fmt.Sprintf("\n%s%s\n\n%s\n\n%s\n", welc, mussh, prompt, m.usernameInput.View())
 	return tea.NewView(s)
 }
 
-// MAIN FUNCTION
-// func main() {
-// 	p := tea.NewProgram(initialModel()) //pointer to new program, p.Run() returns tea.Model and err
+// chatView is the main chat screen shown after username is set
+func (m model) chatView() tea.View {
+	welc := headerStyle.Render("Welcome To")
+	mussh := musshStyle.Render(`
+         ___  ___  _ _                        
+ _ _ _  _ _ / __]/ __]| | | _ _  ___  ___  _ _ _  
+| ' ' || | |\__ \\__ \|   || '_]/ . \/ . \| ' ' |
+|_|_|_| \__|[___/[___/|_|_||_|  \___/\___/|_|_|_|`)
 
-// 	if _, err := p.Run(); err != nil {
-// 		log.Fatal(err)
-// 	}
-// }
+	welcmsg := welcStyle.Render("🧋 Glad you're here! Use the /help command to know more\n✨ Be respectful, everyone's here to have fun!")
+	border := headerStyle.Render("____________________________________________________________")
+
+	//render message history
+	var msgLines string
+	for _, msg := range m.messages {
+		if msg.system {
+			msgLines += systemStyle.Render("* "+msg.text) + "\n"
+		} else {
+			msgLines += usernameStyle.Render(msg.username+": ") + messageStyle.Render(msg.text) + "\n"
+		}
+	}
+
+	help := "enter : send | ctrl+c : quit"
+
+	s := fmt.Sprintf("\n%s%s\n\n%s\n%s\n\n%s\n%s\n%s",
+		welc, mussh, welcmsg, border, msgLines, m.messageInput.View(), help)
+	return tea.NewView(s)
+}
