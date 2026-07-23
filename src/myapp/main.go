@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+  "sync"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
