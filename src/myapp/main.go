@@ -33,26 +33,26 @@ const (
 var (
 	headerStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("199"))
+			Foreground(lipgloss.Color("199")) //hot pink
 
 	musshStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("51"))
+			Foreground(lipgloss.Color("51")) //cyan
 
 	welcStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("99"))
+			Foreground(lipgloss.Color("99")) //purple
 
 	systemStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("214"))
+			Foreground(lipgloss.Color("214")) //orange
 
 	messageStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("255"))
+			Foreground(lipgloss.Color("255")) //white
 
 	usernameStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("141"))
+			Foreground(lipgloss.Color("141")) //light purple
 
 	sessions   = make([]*userSession, 0) //global slice of all connected users
 	sessionsMu sync.Mutex                //mutex to protect sessions slice from race conditions
