@@ -51,8 +51,19 @@ var (
 	messageStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("255")) //white
 
-	sessions   = make([]*userSession, 0) //global slice of all connected users
-	sessionsMu sync.Mutex                //mutex to protect sessions slice from race conditions, ensures each user gets added one by one
+	tabActiveStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("51")) //cyan
+
+	tabInactiveStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("240")) //gray
+
+	sessions   = make(map[string]*userSession) //global map of all connected users
+	sessionsMu sync.Mutex                      //mutex to protect sessions map from race conditions, ensures each user gets added one by one
+
+	rooms       = make(map[string]*room) //global map of all active rooms
+	roomsMu     sync.Mutex              //mutex to protect rooms map from race conditions
+	roomCounter int                     //incrementing counter for room IDs
 )
 
 // stores each connected user's program reference and username
@@ -61,11 +72,31 @@ type userSession struct {
 	program  *tea.Program
 }
 
+// room holds the members of a private room
+type room struct {
+	id      string
+	members map[string]*userSession
+	mu      sync.Mutex
+}
+
 // message type that gets broadcast to all users
 type chatMsg struct {
+	roomID   string
 	username string
 	text     string
 	system   bool //true if its a system message like "X joined"
+}
+
+// roomInviteMsg could be made to send a mesg to users when they are invited, placeholder for now
+type roomInviteMsg struct {
+	r *room
+}
+
+// tabEntry holds a room reference and its message history
+type tabEntry struct {
+	label    string
+	r        *room //nil for global
+	messages []chatMsg
 }
 
 // broadcast sends a chatMsg to every connected user's program
@@ -77,27 +108,59 @@ func broadcast(msg chatMsg) {
 	}
 }
 
+// broadcastToRoom sends a chatMsg to every member of a room
+func broadcastToRoom(r *room, msg chatMsg) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.members {
+		s.program.Send(msg)
+	}
+}
+
 func userSysMsg(s *userSession, msg chatMsg) { //for when they use slash commands, so that it only appears on their screen
 	s.program.Send(msg)
 }
 
-// addSession safely adds a new user session to the global slice
+// addSession safely adds a new user session to the global map
 func addSession(s *userSession) {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
-	sessions = append(sessions, s)
+	sessions[s.username] = s
 }
 
 // removeSession safely removes a user session when they disconnect
 func removeSession(s *userSession) {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
-	for i, sess := range sessions {
-		if sess == s {
-			sessions = append(sessions[:i], sessions[i+1:]...) //removes that session by ignoring that particular index of i
-			return
+	delete(sessions, s.username)
+}
+
+// createRoom makes a new room, adds members, and sends roomInviteMsg to each
+func createRoom(creator *userSession, targetUsernames []string) {
+	roomsMu.Lock()
+	roomCounter++
+	id := fmt.Sprintf("room-number-%d", roomCounter)
+	r := &room{
+		id:      id,
+		members: make(map[string]*userSession),
+	}
+	rooms[id] = r
+	roomsMu.Unlock()
+
+	sessionsMu.Lock()
+	r.members[creator.username] = creator
+	for _, name := range targetUsernames {
+		if s, isonline := sessions[name]; isonline {
+			r.members[name] = s
 		}
 	}
+	sessionsMu.Unlock()
+
+	r.mu.Lock()
+	for _, s := range r.members {
+		s.program.Send(roomInviteMsg{r: r})
+	}
+	r.mu.Unlock()
 }
 
 func main() {
@@ -123,7 +186,7 @@ func main() {
 	}
 
 	//done channel is meant for catching signals to stop the server
-	done := make(chan os.Signal, 1)                                    //makes a channel which is an interface to get access to incoming signals
+	done := make(chan os.Signal, 1)                                     //makes a channel which is an interface to get access to incoming signals
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM) //ctrl+c to end the server , sigint means signal interrupt i.e. ctrl+c
 	log.Info("Starting SSH chat server", "host", host, "port", port)   //start up info
 
@@ -191,7 +254,7 @@ func myMiddleware() wish.Middleware {
 // screen represents which screen the user is currently on
 type screen int
 
-const (
+const (                           
 	usernameScreen screen = iota //iota is basically enumeration - 0
 	chatScreen                   // 1
 )
@@ -202,8 +265,9 @@ type model struct {
 	currentScreen screen          //info of which screen the user is on, user or chat screen (use in rooms later)
 	usernameInput textinput.Model //input box for username entry
 	messageInput  textinput.Model //input box for chat messages
-	messages      []chatMsg       //history of all received messages
-	usernameStyle lipgloss.Style
+	tabs          []tabEntry      //amount of tabs
+	activeTab     int             //current tab
+	usernameStyle lipgloss.Style  
 	width         int
 	height        int
 }
@@ -228,7 +292,8 @@ func initialModel(sess *userSession, width, height int) model { //model state wh
 		currentScreen: usernameScreen,
 		usernameInput: unInput,
 		messageInput:  msgInput,
-		messages:      []chatMsg{},
+		tabs:          []tabEntry{{label: "global", r: nil, messages: []chatMsg{}}},
+		activeTab:     0,
 		width:         width,
 		height:        height,
 		usernameStyle: lipgloss.NewStyle().
@@ -251,8 +316,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 
-	case chatMsg: //a broadcast message arrived, append to chat history array
-		m.messages = append(m.messages, msg)
+	case chatMsg: //a broadcast message arrived, append to correct tab's history
+		for i, t := range m.tabs {
+			if t.r == nil && msg.roomID == "" {
+				m.tabs[i].messages = append(m.tabs[i].messages, msg)
+				break
+			}
+			if t.r != nil && t.r.id == msg.roomID {
+				m.tabs[i].messages = append(m.tabs[i].messages, msg)
+				break
+			}
+		}
+		return m, nil
+
+	case roomInviteMsg: //a new room was created and this user is also a member
+		m.tabs = append(m.tabs, tabEntry{label: msg.r.id, r: msg.r, messages: []chatMsg{}})
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -261,6 +339,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch key {
 		case "ctrl+c":
 			return m, tea.Quit
+
+		case "tab": //go to next tab
+			m.activeTab = (m.activeTab + 1) % len(m.tabs)
+			return m, nil
+
+		case "shift+tab": //back to previous tab
+			m.activeTab = (m.activeTab - 1 + len(m.tabs)) % len(m.tabs)
+			return m, nil
 
 		case "enter":
 			if m.currentScreen == usernameScreen { //i.e. screen where they enter username
@@ -274,6 +360,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messageInput.Focus()       //taking cursor to chat and away from username input text box
 				m.usernameInput.Blur()
 				m.usernameInput.SetValue("")
+
+				sessionsMu.Lock()
+				delete(sessions, "")  //ig this user session is automatically created on connection
+				sessions[username] = m.sess
+				sessionsMu.Unlock()
 
 				//broadcast join message to everyone
 				go broadcast(chatMsg{ //goroutine
@@ -292,7 +383,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// detecting slash commands
 				if strings.HasPrefix(text, "/") {
 					parts := strings.SplitN(text, " ", 2) //splits it into "/command" and "args"
-					command := parts[0]                   //name of command like 'help'
+					command := parts[0]                    //name of command like 'help'
 					args := ""
 
 					if len(parts) > 1 { //i.e the args to the commands like COLOR in /usercolor
@@ -303,7 +394,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					case "/help":
 						go userSysMsg(m.sess, chatMsg{ //broadcasts a system message only to user
-							text:   "🍄 available commands : /help /user /emoji /colors /quit /usercolor COLOR",
+							text:   "🍄 available commands : /help /user /emoji /colors /quit /usercolor COLOR /room USER1 USER2...",
 							system: true})
 						m.messageInput.SetValue("")
 
@@ -346,6 +437,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							text:   fmt.Sprintf("🍄 username color changed to : %s", args),
 							system: true})
 
+					case "/room":
+						if args == "" {
+							go userSysMsg(m.sess, chatMsg{
+								text:   "🍄 usage : /room USER1 USER2...",
+								system: true})
+							m.messageInput.SetValue("")
+							return m, nil
+						}
+						targetUsernames := strings.Fields(args)
+						go createRoom(m.sess, targetUsernames)
+						m.messageInput.SetValue("")
+
 					case "/quit":
 						return m, tea.Quit
 
@@ -361,12 +464,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				m.messageInput.SetValue("") //once message broadcasted set the box empty
 
-				//broadcast the message to all users
-				go broadcast(chatMsg{ //goroutine to broadcast the message to all channels
-					username: m.sess.username,
-					text:     text,
-					system:   false,
-				})
+				activeRoom := m.tabs[m.activeTab].r
+				if activeRoom == nil {
+					//this cases means that user wants to send a global mesg
+					go broadcast(chatMsg{ //goroutine to broadcast the message to all channels
+						roomID:   "",
+						username: m.sess.username,
+						text:     text,
+						system:   false,
+					})
+				} else {
+					//broadcast the message to room members only
+					go broadcastToRoom(activeRoom, chatMsg{
+						roomID:   activeRoom.id,
+						username: m.sess.username,
+						text:     text,
+						system:   false,
+					})
+				}
 				return m, nil
 			}
 		}
@@ -415,9 +530,19 @@ func (m model) chatView() tea.View {
 	welcmsg := welcStyle.Render("🧋 Glad you're here! Use the /help command to know more\n✨ Be respectful, everyone's here to have fun!")
 	border := headerStyle.Render("____________________________________________________________")
 
+	//render tabs
+	var tabBar string
+	for i, t := range m.tabs {
+		if i == m.activeTab {
+			tabBar += tabActiveStyle.Render("["+t.label+"]") + " "
+		} else {
+			tabBar += tabInactiveStyle.Render("["+t.label+"]") + " "
+		}
+	}
+
 	//render message history
 	var msgLines string
-	for _, msg := range m.messages {
+	for _, msg := range m.tabs[m.activeTab].messages {
 		if msg.system {
 			msgLines += systemStyle.Render("* "+msg.text) + "\n"
 		} else {
@@ -425,9 +550,9 @@ func (m model) chatView() tea.View {
 		}
 	}
 
-	help := "/help for commands | enter : send | ctrl+c or /quit : exit chat"
+	help := "/help for commands | enter : send | tab / shift+tab : switch tabs | ctrl+c or /quit : exit chat"
 
-	s := fmt.Sprintf("\n%s%s\n\n%s\n%s\n\n%s\n%s\n%s",
-		welc, mussh, welcmsg, border, msgLines, m.messageInput.View(), help)
+	s := fmt.Sprintf("\n%s%s\n\n%s\n%s\n\n%s\n%s\n\n%s\n%s",
+		welc, mussh, welcmsg, border, tabBar, msgLines, m.messageInput.View(), help)
 	return tea.NewView(s)
 }
