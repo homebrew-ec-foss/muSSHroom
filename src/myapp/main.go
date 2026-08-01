@@ -125,7 +125,7 @@ func userSysMsg(s *userSession, msg chatMsg) { //for when they use slash command
 func addSession(s *userSession) {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
-	sessions[s.username] = s
+    sessions[s.username] = s
 }
 
 // removeSession safely removes a user session when they disconnect
@@ -354,12 +354,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if username == "" {
 					return m, nil
 				}
+
+				_, ok := sessions[username] //ok returns true if that username is taken
+				if ok{ //if username already exists
+
+					m.currentScreen = chatScreen //take them to the chat screen
+					m.messageInput.Focus()       //taking cursor to chat and away from username input text box
+					m.usernameInput.Blur()
+					m.usernameInput.SetValue("")
+
+					go userSysMsg(m.sess, chatMsg{ //broadcasts a system message only to user
+							text:   "🍄 This username is already taken",
+							system: true})
+					return m, nil
+				}
+
+
 				//set username on the session so broadcast can use it
 				m.sess.username = username
 				m.currentScreen = chatScreen //take them to the chat screen
 				m.messageInput.Focus()       //taking cursor to chat and away from username input text box
 				m.usernameInput.Blur()
 				m.usernameInput.SetValue("")
+
 
 				sessionsMu.Lock()
 				delete(sessions, "")  //ig this user session is automatically created on connection
