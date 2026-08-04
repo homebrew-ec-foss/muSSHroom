@@ -225,8 +225,6 @@ func myMiddleware() wish.Middleware {
 		p := tea.NewProgram(m, bubbletea.MakeOptions(s)...)          //create a new bubbletea program for this user session
 		sess.program = p
 
-		//add session to global slice when user connects
-		addSession(sess)
 
 		//remove session and broadcast disconnect message when user disconnects
 		go func() {
@@ -270,6 +268,7 @@ type model struct {
 	usernameStyle lipgloss.Style  
 	width         int
 	height        int
+	err		   string          //error message for username taken
 }
 
 func initialModel(sess *userSession, width, height int) model { //model state when user first enters in
@@ -340,7 +339,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 
-		case "tab": //go to next tab
+		case "tab": //go to next 
 			m.activeTab = (m.activeTab + 1) % len(m.tabs)
 			return m, nil
 
@@ -354,21 +353,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if username == "" {
 					return m, nil
 				}
-
+				sessionsMu.Lock()
+				defer sessionsMu.Unlock() //unlock after this function is done
 				_, ok := sessions[username] //ok returns true if that username is taken
 				if ok{ //if username already exists
-
-					m.currentScreen = chatScreen //take them to the chat screen
-					m.messageInput.Focus()       //taking cursor to chat and away from username input text box
-					m.usernameInput.Blur()
 					m.usernameInput.SetValue("")
-
-					go userSysMsg(m.sess, chatMsg{ //broadcasts a system message only to user
-							text:   "🍄 This username is already taken",
-							system: true})
+					m.err = "username already taken, try again" //since there is no tea program made yet for new users cant use sendmesg
 					return m, nil
 				}
-
+				m.err = "" //clear error mesg if username proceeds smoothly
 
 				//set username on the session so broadcast can use it
 				m.sess.username = username
@@ -376,12 +369,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messageInput.Focus()       //taking cursor to chat and away from username input text box
 				m.usernameInput.Blur()
 				m.usernameInput.SetValue("")
-
-
-				sessionsMu.Lock()
-				delete(sessions, "")  //ig this user session is automatically created on connection
 				sessions[username] = m.sess
-				sessionsMu.Unlock()
+			
 
 				//broadcast join message to everyone
 				go broadcast(chatMsg{ //goroutine
@@ -416,6 +405,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.messageInput.SetValue("")
 
 					case "/user":
+						sessionsMu.Lock()
+						delete(sessions, m.sess.username) //removes the current name from sessions
+						sessionsMu.Unlock()
 						m.currentScreen = usernameScreen //switches to username screen
 						m.messageInput.Blur()
 						m.usernameInput.Focus()
@@ -531,7 +523,7 @@ func (m model) usernameView() tea.View {
 |_|_|_| \__|[___/[___/|_|_||_|  \___/\___/|_|_|_|`)
 
 	prompt := welcStyle.Render("🍄 Choose a username to join the chat:")
-	s := fmt.Sprintf("\n%s%s\n\n%s\n\n%s\n", welc, mussh, prompt, m.usernameInput.View())
+	s := fmt.Sprintf("\n%s%s\n\n%s\n\n%s\n %s\n", welc, mussh, prompt, m.usernameInput.View(),m.err)
 	return tea.NewView(s)
 }
 
