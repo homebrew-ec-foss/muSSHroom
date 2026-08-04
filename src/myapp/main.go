@@ -183,6 +183,7 @@ func main() {
 	)
 	if err != nil {
 		log.Error("Could not start server", "error", err)
+		os.Exit(1)
 	}
 
 	//done channel is meant for catching signals to stop the server
