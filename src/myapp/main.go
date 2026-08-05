@@ -99,13 +99,13 @@ type tabEntry struct {
 	messages []chatMsg
 }
 
-// broadcast sends a chatMsg to every connected user's program
-func broadcast(msg chatMsg) {
-	sessionsMu.Lock()
-	defer sessionsMu.Unlock() //defer waits for the function to finish executing and then executes, even if there's an error
-	for _, s := range sessions {
-		s.program.Send(msg)
-	}
+	// broadcast sends a chatMsg to every connected user's program
+	func broadcast(msg chatMsg) {
+		sessionsMu.Lock()
+		defer sessionsMu.Unlock() //defer waits for the function to finish executing and then executes, even if there's an error
+		for _, s := range sessions {
+			s.program.Send(msg)
+		}
 }
 
 // broadcastToRoom sends a chatMsg to every member of a room
@@ -164,6 +164,7 @@ func createRoom(creator *userSession, targetUsernames []string) {
 }
 
 func main() {
+	os.Setenv("FORCE_COLOR", "1")
 
 	//setting SSH host key path
 	keyPath := os.Getenv("SSH_HOST_KEY_PATH")
@@ -340,7 +341,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 
-		case "tab": //go to next
+		case "tab": //go to next tab
 			m.activeTab = (m.activeTab + 1) % len(m.tabs)
 			return m, nil
 
@@ -433,7 +434,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							go userSysMsg(m.sess, chatMsg{ //broadcasts a system message only to user
 								roomID: "",
 								text: `
-🍄 here's emoji's you can access quickly, first select the one you want
+🍄 Use shortcode notation, or here's emoji's you can access quickly, first select the one you want
 ctrl+shift+c --> ctrl+shift+v into your message box
 😂 😭 ☺️ 🐮 🍄 🤡 🥀 🌈 🔥 🍩 ❤️ ‼️ 👍
 WARNING: DO NOT CTRL+C`,
@@ -443,7 +444,7 @@ WARNING: DO NOT CTRL+C`,
 							go userSysMsg(m.sess, chatMsg{ //broadcasts a system message only to user
 								roomID: activeRoom.id,
 								text: `
-🍄 here's emoji's you can access quickly, first select the one you want
+🍄 Use shortcode notation, or here's emoji's you can access quickly, first select the one you want
 ctrl+shift+c --> ctrl+shift+v into your message box
 😂 😭 ☺️ 🐮 🍄 🤡 🥀 🌈 🔥 🍩 ❤️ ‼️ 👍
 WARNING: DO NOT CTRL+C`,
@@ -551,7 +552,21 @@ WARNING: DO NOT CTRL+C`,
 				}
 
 				m.messageInput.SetValue("") //once message broadcasted set the box empty
-
+				text = strings.ReplaceAll(text, ":sob:", "😭")
+				text = strings.ReplaceAll(text, ":joy:", "😂")
+				text = strings.ReplaceAll(text, ":relaxed:", "☺️")
+				text = strings.ReplaceAll(text, ":cow:", "🐮")
+				text = strings.ReplaceAll(text, ":mushroom:", "🍄")
+				text = strings.ReplaceAll(text, ":clown:", "🤡")
+				text = strings.ReplaceAll(text, ":wilted_flower:", "🥀")
+				text = strings.ReplaceAll(text, ":wilted_rose:", "🥀")
+				text = strings.ReplaceAll(text, ":rainbow:", "🌈")
+				text = strings.ReplaceAll(text, ":fire:", "🔥")
+				text = strings.ReplaceAll(text, ":doughnut:", "🍩")
+				text = strings.ReplaceAll(text, ":heart:", "❤️")
+				text = strings.ReplaceAll(text, ":bangbang:", "‼️")
+				text = strings.ReplaceAll(text, ":thumbsup:", "👍")
+				text = strings.ReplaceAll(text, ":+1:", "👍")
 				activeRoom := m.tabs[m.activeTab].r
 				if activeRoom == nil {
 					//this cases means that user wants to send a global mesg
