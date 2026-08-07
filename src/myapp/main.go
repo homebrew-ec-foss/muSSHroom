@@ -105,13 +105,13 @@ type tabEntry struct {
 	messages []chatMsg
 }
 
-	// broadcast sends a chatMsg to every connected user's program
-	func broadcast(msg chatMsg) {
-		sessionsMu.Lock()
-		defer sessionsMu.Unlock() //defer waits for the function to finish executing and then executes, even if there's an error
-		for _, s := range sessions {
-			s.program.Send(msg)
-		}
+// broadcast sends a chatMsg to every connected user's program
+func broadcast(msg chatMsg) {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock() //defer waits for the function to finish executing and then executes, even if there's an error
+	for _, s := range sessions {
+		s.program.Send(msg)
+	}
 }
 
 // broadcastToRoom sends a chatMsg to every member of a room
@@ -429,6 +429,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					if len(parts) > 1 { //i.e the args to the commands like COLOR in /usercolor
 						args = parts[1]
+						args = strings.TrimSpace(args)
 					}
 
 					switch command { //to see which command is entered and send a user sysmsg to their session accordingly
