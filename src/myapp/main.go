@@ -439,7 +439,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							//this cases means that user is on the global room, sysmsg goes there
 							go userSysMsg(m.sess, chatMsg{
 								roomID: "",
-								text:   "🍄 slash commands : /help /user /emoji /colors /quit /usercolor COLOR /room USER1 USER2... /deleteroom",
+								text:   "🍄 slash commands : /help /user /emoji /colors /quit /usercolor COLOR /room RNAME USER1 USER2... /deleteroom",
 								system: true})
 						} else {
 							//broadcast the sys message to user in their respective room
